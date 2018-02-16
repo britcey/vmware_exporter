@@ -9,16 +9,14 @@ import argparse
 import pytz
 import ssl
 import sys
-import time
+import urlparse
 
 from datetime import datetime
 from yamlconfig import YamlConfig
 
-# Twisted
-from twisted.web.server import Site, NOT_DONE_YET
-from twisted.web.resource import Resource
-from twisted.internet import reactor
-from twisted.internet.task import deferLater
+from BaseHTTPServer import BaseHTTPRequestHandler
+from BaseHTTPServer import HTTPServer
+from SocketServer import ForkingMixIn
 
 # VMWare specific imports
 from pyVmomi import vim, vmodl
@@ -26,16 +24,17 @@ from pyVim import connect
 
 # Prometheus specific imports
 from prometheus_client.core import GaugeMetricFamily, _floatToGoString
+from prometheus_client import CONTENT_TYPE_LATEST
 
+class ForkingHTTPServer(ForkingMixIn, HTTPServer):
+    pass
 
-class VMWareMetricsResource(Resource):
-    """
-    VMWare twisted ``Resource`` handling multi endpoints
-    Only handle /metrics and /healthz path
-    """
-    isLeaf = True
+class VMWareMetricsHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
-    def __init__(self, args):
+    def do_GET(self):
+        import pdb; pdb.set_trace()
         try:
             self.config = YamlConfig(args.config_file)
             if 'default' not in self.config.keys():
@@ -44,33 +43,37 @@ class VMWareMetricsResource(Resource):
         except:
             raise SystemExit("Error, cannot read configuration file")
 
-
-    def render_GET(self, request):
-        path = request.path.decode()
-        request.setHeader("Content-Type", "text/plain; charset=UTF-8")
-        if path == '/metrics':
-            if not request.args.get('target', [None])[0]:
-                request.setResponseCode(404)
-                return 'No target defined\r\n'.encode()
-            d = deferLater(reactor, 0, lambda: request)
-            d.addCallback(self.generate_latest_target)
-            d.addErrback(self.errback, request)
-            return NOT_DONE_YET
-        elif path == '/healthz':
-            request.setResponseCode(200)
-            return 'Server is UP'.encode()
+        url = urlparse.urlparse(self.path)
+        if url.path == '/metrics':
+            self.generate_latest_target(url)
+        elif url.path == '/healthz':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write('Server is UP'.encode())
+        elif url.path == '/':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write("""<html>
+            <head><title>VMWare Exporter</title></head>
+            <body>
+            <h1>VMWare Exporter</h1>
+            <p>Visit <code>/metrics</code> to use.</p>
+            </body>
+            </html>""")
         else:
-            request.setResponseCode(404)
-            return '404 Not Found'.encode()
+            self.send_response(404)
+            self.end_headers()
 
-    def errback(self, failure, request):
-        failure.printTraceback()
-        request.processingFailed(failure) # This will send a trace to the browser and close the request.
-        return None
+    def generate_latest_target(self, url):
+        params = urlparse.parse_qs(url.query)
+        if 'target' not in params:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write("Missing 'target' from parameters")
+            return
+        target = params.get('target')[0]
+        section = params.get("section", ["default"])[0]
 
-    def generate_latest_target(self, request):
-        target = request.args.get('target', [None])[0]
-        section = request.args.get('section', ['default'])[0]
         output = []
         for metric in self.collect(target, section):
             output.append('# HELP {0} {1}'.format(
@@ -86,12 +89,15 @@ class VMWareMetricsResource(Resource):
                     labelstr = ''
                 output.append('{0}{1} {2}\n'.format(name, labelstr, _floatToGoString(value)))
         if output != []:
-            request.write(''.join(output).encode('utf-8'))
-            request.finish()
+            self.send_response(200)
+            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
+            self.end_headers()
+            self.wfile.write(''.join(output).encode('utf-8'))
         else:
-            request.setResponseCode(500, message=('cannot connect to vmware'))
-            request.finish()
-            return
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write('cannot connect to vmware')
+
 
     def collect(self, target=None, section='default'):
         if section not in self.config.keys():
@@ -427,7 +433,10 @@ class VMWareMetricsResource(Resource):
                             float(summary.hardware.memorySize) / 1024 / 1024)
 
 
-def main():
+if __name__ == '__main__':
+    reload(sys)
+    sys.setdefaultencoding("utf-8")
+
     parser = argparse.ArgumentParser(description='VMWare metrics exporter for Prometheus')
     parser.add_argument('-c', '--config', dest='config_file',
                         default='config.yml', help="configuration file")
@@ -436,18 +445,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Start up the server to expose the metrics.
-    root = Resource()
-    root.putChild(b'metrics', VMWareMetricsResource(args))
-    root.putChild(b'healthz', VMWareMetricsResource(args))
+    try:
 
-    factory = Site(root)
-    print("Starting web server on port {}".format(args.port))
-    reactor.listenTCP(args.port, factory)
-    reactor.run()
+        print("Starting web server on port {}".format(args.port))
 
-
-if __name__ == '__main__':
-    reload(sys)
-    sys.setdefaultencoding("utf-8")
-    main()
+        server = ForkingHTTPServer(('', args.port), VMWareMetricsHandler)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print(" Interrupted")
+        exit(0)
